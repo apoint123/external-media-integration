@@ -3,14 +3,7 @@ name = "external-media-integration"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-crate-type = ["cdylib"]
-
 [dependencies]
-# N-API
-napi = { version = "3.8", features = ["tokio_rt", "napi9"] }
-napi-derive = "3.5"
-
 # Async Runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -32,9 +25,6 @@ serde_json = "1.0"
 # Utilities
 discord-rich-presence = "1.0"
 url = "2.5"
-
-[build-dependencies]
-napi-build = "2.3"
 
 # Windows
 [target.'cfg(target_os = "windows")'.dependencies.windows]

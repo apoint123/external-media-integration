@@ -1,17 +1,13 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
-use napi::{
-    Status,
-    threadsafe_function::{ThreadsafeFunction, UnknownReturnValue},
-};
 
 use crate::model::{
     MetadataPayload, PlayModePayload, PlayStatePayload, SystemMediaEvent, TimelinePayload,
 };
 
-pub type SystemMediaThreadsafeFunction =
-    ThreadsafeFunction<SystemMediaEvent, UnknownReturnValue, SystemMediaEvent, Status, false>;
+/// 事件回调类型，用于接收系统媒体控件的事件
+pub type EventCallback = Arc<dyn Fn(SystemMediaEvent) + Send + Sync>;
 
 static CONTROLS: OnceLock<Box<dyn SystemMediaControls>> = OnceLock::new();
 
@@ -37,8 +33,8 @@ pub trait SystemMediaControls: Send + Sync {
 
     /// 注册事件回调
     ///
-    /// 当用户点击系统的“上一首”、“暂停”按钮时，通过此回调通知 Node.js 层
-    fn register_event_handler(&self, callback: SystemMediaThreadsafeFunction) -> Result<()>;
+    /// 当用户点击系统的"上一首"、"暂停"按钮时，通过此回调通知调用方
+    fn register_event_handler(&self, callback: EventCallback) -> Result<()>;
 
     /// 更新歌曲元数据（标题、歌手、封面等）
     fn update_metadata(&self, payload: MetadataPayload);
@@ -48,7 +44,7 @@ pub trait SystemMediaControls: Send + Sync {
 
     /// 更新播放速率
     fn update_playback_rate(&self, rate: f64);
-    
+
     /// 更新音量
     fn update_volume(&self, volume: f64);
 
@@ -113,7 +109,7 @@ impl SystemMediaControls for NoOpControls {
     fn shutdown(&self) -> Result<()> {
         Ok(())
     }
-    fn register_event_handler(&self, _: SystemMediaThreadsafeFunction) -> Result<()> {
+    fn register_event_handler(&self, _: EventCallback) -> Result<()> {
         Ok(())
     }
     fn update_metadata(&self, _: MetadataPayload) {}

@@ -29,14 +29,14 @@ use crate::{
         MetadataPayload, PlayModePayload, PlayStatePayload, PlaybackStatus, SystemMediaEvent,
         SystemMediaEventType, TimelinePayload,
     },
-    sys_media::{SystemMediaControls, SystemMediaThreadsafeFunction},
+    sys_media::{EventCallback, SystemMediaControls},
 };
 
 pub struct MacosImpl {
     np_info_ctr: Retained<MPNowPlayingInfoCenter>,
     cmd_ctr: Retained<MPRemoteCommandCenter>,
     info: Mutex<Retained<NSMutableDictionary<NSString, AnyObject>>>,
-    event_handler: Arc<Mutex<Option<SystemMediaThreadsafeFunction>>>,
+    event_handler: Arc<Mutex<Option<EventCallback>>>,
     target_tokens: Mutex<Vec<(Retained<MPRemoteCommand>, Retained<AnyObject>)>>,
 }
 
@@ -75,14 +75,11 @@ impl MacosImpl {
         let block = RcBlock::new(
             move |_: NonNull<MPRemoteCommandEvent>| -> MPRemoteCommandHandlerStatus {
                 if let Ok(guard) = handler_arc.lock()
-                    && let Some(tsfn) = guard.as_ref()
+                    && let Some(cb) = guard.as_ref()
                 {
                     debug!(?event_type, "MPRemoteCommand 触发");
                     let evt = SystemMediaEvent::new(event_type);
-                    tsfn.call(
-                        evt,
-                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                    );
+                    cb(evt);
                 }
                 MPRemoteCommandHandlerStatus::Success
             },
@@ -110,14 +107,11 @@ impl MacosImpl {
             };
 
             if let Ok(guard) = handler_arc.lock()
-                && let Some(tsfn) = guard.as_ref()
+                && let Some(cb) = guard.as_ref()
             {
                 debug!(?event_type, "MPRemoteCommand Toggle 触发");
                 let evt = SystemMediaEvent::new(event_type);
-                tsfn.call(
-                    evt,
-                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                );
+                cb(evt);
             }
             MPRemoteCommandHandlerStatus::Success
         });
@@ -145,13 +139,10 @@ impl MacosImpl {
                     debug!(position_ms, "MPChangePlaybackPositionCommand 触发");
 
                     if let Ok(guard) = handler_arc.lock()
-                        && let Some(tsfn) = guard.as_ref()
+                        && let Some(cb) = guard.as_ref()
                     {
                         let evt = SystemMediaEvent::seek(position_ms);
-                        tsfn.call(
-                            evt,
-                            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                        );
+                        cb(evt);
                     }
                 }
 
@@ -180,13 +171,10 @@ impl MacosImpl {
                     debug!(rate, "MPChangePlaybackRateCommand 触发");
 
                     if let Ok(guard) = handler_arc.lock()
-                        && let Some(tsfn) = guard.as_ref()
+                        && let Some(cb) = guard.as_ref()
                     {
                         let evt = SystemMediaEvent::set_rate(f64::from(rate));
-                        tsfn.call(
-                            evt,
-                            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                        );
+                        cb(evt);
                     }
                 }
 
@@ -226,13 +214,10 @@ impl MacosImpl {
                     .and_then(|e| e.downcast::<MPChangeShuffleModeCommandEvent>().ok())
                     .is_some()
                     && let Ok(guard) = handler_arc.lock()
-                    && let Some(tsfn) = guard.as_ref()
+                    && let Some(cb) = guard.as_ref()
                 {
                     debug!("MPChangeShuffleModeCommand 触发");
-                    tsfn.call(
-                        SystemMediaEvent::new(SystemMediaEventType::ToggleShuffle),
-                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                    );
+                    cb(SystemMediaEvent::new(SystemMediaEventType::ToggleShuffle));
                 }
                 MPRemoteCommandHandlerStatus::Success
             },
@@ -257,13 +242,10 @@ impl MacosImpl {
                     .and_then(|e| e.downcast::<MPChangeRepeatModeCommandEvent>().ok())
                     .is_some()
                     && let Ok(guard) = handler_arc.lock()
-                    && let Some(tsfn) = guard.as_ref()
+                    && let Some(cb) = guard.as_ref()
                 {
                     debug!("MPChangeRepeatModeCommand 触发");
-                    tsfn.call(
-                        SystemMediaEvent::new(SystemMediaEventType::ToggleRepeat),
-                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                    );
+                    cb(SystemMediaEvent::new(SystemMediaEventType::ToggleRepeat));
                 }
                 MPRemoteCommandHandlerStatus::Success
             },
@@ -375,7 +357,7 @@ impl SystemMediaControls for MacosImpl {
         Ok(())
     }
 
-    fn register_event_handler(&self, callback: SystemMediaThreadsafeFunction) -> Result<()> {
+    fn register_event_handler(&self, callback: EventCallback) -> Result<()> {
         {
             let mut guard = self
                 .event_handler

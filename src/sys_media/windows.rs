@@ -1,7 +1,6 @@
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::Result;
-use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use tokio::{runtime::Runtime, task::JoinHandle};
 use tracing::{debug, error, info, instrument, warn};
 use windows::{
@@ -22,7 +21,7 @@ use crate::{
         MetadataPayload, PlayModePayload, PlayStatePayload, PlaybackStatus, RepeatMode,
         SystemMediaEvent, SystemMediaEventType, TimelinePayload,
     },
-    sys_media::{SystemMediaControls, SystemMediaThreadsafeFunction},
+    sys_media::{EventCallback, SystemMediaControls},
 };
 
 const HNS_PER_MILLISECOND: f64 = 10_000.0;
@@ -41,7 +40,7 @@ struct SmtcHandlerTokens {
 struct SmtcContext {
     player: MediaPlayer,
     tokens: SmtcHandlerTokens,
-    callback: Option<Arc<SystemMediaThreadsafeFunction>>,
+    callback: Option<EventCallback>,
     cover_task: Option<JoinHandle<()>>,
     is_enabled: bool,
 }
@@ -84,20 +83,16 @@ static SMTC_CONTEXT: LazyLock<Mutex<Option<SmtcContext>>> = LazyLock::new(|| Mut
 fn dispatch_event(event: SystemMediaEvent) {
     debug!(type_ = ?event.type_, "分发 SMTC 事件");
 
-    let maybe_callback: Option<Arc<SystemMediaThreadsafeFunction>> =
-        SMTC_CONTEXT.lock().map_or_else(
-            |_| {
-                error!("SMTC 事件回调锁中毒");
-                None
-            },
-            |guard| guard.as_ref().and_then(|ctx| ctx.callback.clone()),
-        );
+    let maybe_callback: Option<EventCallback> = SMTC_CONTEXT.lock().map_or_else(
+        |_| {
+            error!("SMTC 事件回调锁中毒");
+            None
+        },
+        |guard| guard.as_ref().and_then(|ctx| ctx.callback.clone()),
+    );
 
-    if let Some(tsfn) = maybe_callback {
-        let status = tsfn.call(event, ThreadsafeFunctionCallMode::NonBlocking);
-        if status != napi::Status::Ok {
-            error!("调用 JS 回调失败, status: {:?}", status);
-        }
+    if let Some(cb) = maybe_callback {
+        cb(event);
     } else {
         warn!("无法分发 SMTC 事件，因为没有注册回调函数");
     }
@@ -293,11 +288,11 @@ impl SystemMediaControls for WindowsImpl {
         Ok(())
     }
 
-    fn register_event_handler(&self, callback: SystemMediaThreadsafeFunction) -> Result<()> {
+    fn register_event_handler(&self, callback: EventCallback) -> Result<()> {
         match SMTC_CONTEXT.lock() {
             Ok(mut guard) => {
                 if let Some(ctx) = guard.as_mut() {
-                    ctx.callback = Some(Arc::new(callback));
+                    ctx.callback = Some(callback);
                     debug!("SMTC 事件回调已成功注册");
                 } else {
                     warn!("尝试注册回调，但 SMTC 未初始化");

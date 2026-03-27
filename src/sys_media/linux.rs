@@ -11,7 +11,6 @@ use mpris_server::{
     LoopStatus as MprisLoopStatus, Metadata, PlaybackStatus as MprisPlaybackStatus, Player, Time,
     zbus::zvariant::ObjectPath,
 };
-use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use tempfile::NamedTempFile;
 use tokio::{
     runtime::Runtime,
@@ -24,7 +23,7 @@ use crate::{
         MetadataPayload, PlayModePayload, PlayStatePayload, PlaybackStatus, RepeatMode,
         SystemMediaEvent, SystemMediaEventType, TimelinePayload,
     },
-    sys_media::{SystemMediaControls, SystemMediaThreadsafeFunction},
+    sys_media::{EventCallback, SystemMediaControls},
 };
 
 /// 主线程和后台 D-Bus 现成通信的指令
@@ -37,7 +36,7 @@ pub enum MprisCommand {
     UpdatePlayMode(PlayModePayload),
     Enable,
     Disable,
-    RegisterCallback(SystemMediaThreadsafeFunction),
+    RegisterCallback(EventCallback),
     Shutdown,
 }
 
@@ -75,15 +74,12 @@ impl LinuxImpl {
     }
 }
 
-fn setup_mpris_signals(
-    player: &Player,
-    event_handler: Arc<RwLock<Option<SystemMediaThreadsafeFunction>>>,
-) {
+fn setup_mpris_signals(player: &Player, event_handler: Arc<RwLock<Option<EventCallback>>>) {
     let dispatch = move |evt: SystemMediaEvent| {
         if let Ok(guard) = event_handler.read()
-            && let Some(tsfn) = guard.as_ref()
+            && let Some(cb) = guard.as_ref()
         {
-            tsfn.call(evt, ThreadsafeFunctionCallMode::NonBlocking);
+            cb(evt);
         }
     };
 
@@ -257,7 +253,7 @@ async fn process_metadata_update(
 async fn handle_command(
     cmd: MprisCommand,
     player: &Player,
-    event_handler: &Arc<RwLock<Option<SystemMediaThreadsafeFunction>>>,
+    event_handler: &Arc<RwLock<Option<EventCallback>>>,
     cover_guard: &mut Option<NamedTempFile>,
 ) -> bool {
     match cmd {
@@ -325,7 +321,7 @@ async fn handle_command(
 
 #[allow(clippy::future_not_send)]
 async fn run_mpris_loop(mut rx: UnboundedReceiver<MprisCommand>) -> Result<()> {
-    let event_handler = Arc::new(RwLock::new(None::<SystemMediaThreadsafeFunction>));
+    let event_handler = Arc::new(RwLock::new(None::<EventCallback>));
     let mut current_cover_file_guard: Option<NamedTempFile> = None;
 
     let pid = process::id();
@@ -402,7 +398,7 @@ impl SystemMediaControls for LinuxImpl {
         Ok(())
     }
 
-    fn register_event_handler(&self, callback: SystemMediaThreadsafeFunction) -> Result<()> {
+    fn register_event_handler(&self, callback: EventCallback) -> Result<()> {
         self.send_command(MprisCommand::RegisterCallback(callback));
         Ok(())
     }
