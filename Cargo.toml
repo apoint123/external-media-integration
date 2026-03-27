@@ -9,13 +9,6 @@ tokio = { version = "1", features = ["full"] }
 
 # Log
 tracing = "0.1"
-tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", features = [
-    "env-filter",
-    "time",
-    "local-time",
-] }
-time = { version = "0.3", features = ["macros", "formatting", "local-offset"] }
 
 # Error & Serialize
 anyhow = "1.0"

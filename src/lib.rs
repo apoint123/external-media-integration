@@ -7,7 +7,6 @@
 use anyhow::Result;
 
 mod discord;
-mod logger;
 pub mod model;
 mod sys_media;
 
@@ -19,20 +18,14 @@ use model::{
 
 /// 初始化插件
 ///
-/// ### 参数
-///
-/// * `log_dir` - 要把日志文件保存到的路径
-///
 /// ### Errors
 ///
-/// 可能会在日志初始化失败，或者媒体控件初始化失败时抛出错误
+/// 可能会在媒体控件初始化失败时返回错误
 ///
 /// ### 备注
 ///
 /// 如果其他 API 调用失败，则只会打印日志并静默失败
-pub fn initialize(log_dir: String) -> Result<()> {
-    logger::init(log_dir)?;
-
+pub fn initialize() -> Result<()> {
     discord::init();
 
     sys_media::get_platform_controls().initialize()?;
@@ -40,7 +33,7 @@ pub fn initialize(log_dir: String) -> Result<()> {
     Ok(())
 }
 
-/// 关闭插件，清理资源
+/// 关闭媒体控件，清理资源
 pub fn shutdown() {
     discord::disable();
     let _ = sys_media::get_platform_controls().shutdown();
@@ -50,7 +43,7 @@ pub fn shutdown() {
 ///
 /// ### Errors
 ///
-/// 会在调用 API 失败时抛出错误
+/// 会在调用 API 失败时返回错误
 pub fn enable_system_media() -> Result<()> {
     sys_media::get_platform_controls().enable()
 }
@@ -59,7 +52,7 @@ pub fn enable_system_media() -> Result<()> {
 ///
 /// ### Errors
 ///
-/// 会在调用 API 失败时抛出错误
+/// 会在调用 API 失败时返回错误
 pub fn disable_system_media() -> Result<()> {
     sys_media::get_platform_controls().disable()
 }
