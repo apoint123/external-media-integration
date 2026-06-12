@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::{
     EventCallback,
+    NowPlayingOptions,
     model::{
         MetadataPayload,
         PlayModePayload,
@@ -14,7 +15,7 @@ pub struct NoOpImpl;
 
 #[expect(clippy::unused_async)]
 impl NoOpImpl {
-    pub async fn new(_hwnd: Option<isize>, _callback: EventCallback) -> Result<Self> {
+    pub async fn new(_options: &NowPlayingOptions, _callback: EventCallback) -> Result<Self> {
         Ok(Self)
     }
 

@@ -208,4 +208,6 @@ pub struct NowPlayingOptions {
     pub hwnd: Option<isize>,
     /// Discord 配置，传 None 则代表禁用/不初始化 Discord RPC
     pub discord: Option<DiscordOptions>,
+    /// 应用名称，Linux 下用于 MPRIS 的 identity 和 desktop_entry
+    pub app_name: Option<String>,
 }

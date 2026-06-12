@@ -60,7 +60,7 @@ pub fn spawn_coordinator_loop(
 
         let local = LocalSet::new();
         local.block_on(&rt, async move {
-            let mut os_adapter = match PlatformMediaControls::new(options.hwnd, callback).await {
+            let mut os_adapter = match PlatformMediaControls::new(&options, callback).await {
                 Ok(adapter) => adapter,
                 Err(e) => {
                     error!("初始化媒体控件失败: {e}");

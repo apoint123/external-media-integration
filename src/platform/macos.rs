@@ -51,6 +51,7 @@ use tracing::{
 
 use crate::{
     EventCallback,
+    NowPlayingOptions,
     model::{
         MetadataPayload,
         PlayModePayload,
@@ -71,7 +72,7 @@ pub struct MacosImpl {
 
 #[expect(clippy::unused_async, clippy::future_not_send)]
 impl MacosImpl {
-    pub async fn new(_hwnd: Option<isize>, callback: EventCallback) -> Result<Self> {
+    pub async fn new(_options: &NowPlayingOptions, callback: EventCallback) -> Result<Self> {
         let np_info_ctr = unsafe { MPNowPlayingInfoCenter::defaultCenter() };
         let cmd_ctr = unsafe { MPRemoteCommandCenter::sharedCommandCenter() };
         let info = NSMutableDictionary::new();

@@ -33,6 +33,7 @@ use tracing::{
 
 use crate::{
     EventCallback,
+    NowPlayingOptions,
     model::{
         MetadataPayload,
         PlayModePayload,
@@ -54,14 +55,18 @@ pub struct LinuxImpl {
 
 #[expect(clippy::unused_async, clippy::future_not_send)]
 impl LinuxImpl {
-    pub async fn new(_hwnd: Option<isize>, callback: EventCallback) -> Result<Self> {
+    pub async fn new(options: &NowPlayingOptions, callback: EventCallback) -> Result<Self> {
         info!("正在初始化 Linux MPRIS...");
 
+        let app_name = options.app_name.as_deref();
         let pid = process::id();
         // 使用唯一标识符以避免多个实例冲突
-        let identity = format!("splayer.instance{pid}");
+        let identity = app_name.map_or_else(
+            || format!("player.instance{pid}"),
+            |name| format!("{name}.instance{pid}"),
+        );
 
-        let player = Player::builder(&identity)
+        let mut builder = Player::builder(&identity)
             .can_play(true)
             .can_pause(true)
             .can_go_next(true)
@@ -70,9 +75,13 @@ impl LinuxImpl {
             .can_control(true)
             .minimum_rate(0.2)
             .maximum_rate(2.0)
-            .playback_status(MprisPlaybackStatus::Stopped)
-            .identity("SPlayer")
-            .desktop_entry("SPlayer")
+            .playback_status(MprisPlaybackStatus::Stopped);
+
+        if let Some(name) = app_name {
+            builder = builder.identity(name).desktop_entry(name);
+        }
+
+        let player = builder
             .build()
             .await
             .map_err(|e| anyhow::anyhow!("MPRIS Player 初始化失败: {e}"))?;
@@ -261,7 +270,7 @@ impl LinuxImpl {
             |id| id.to_string(),
         );
 
-        let track_path = format!("/com/splayer/track/{track_id_str}");
+        let track_path = format!("/com/player/track/{track_id_str}");
 
         if let Ok(op) = ObjectPath::try_from(track_path.as_str()) {
             mb = mb.trackid(op);

@@ -38,6 +38,7 @@ use windows::{
 
 use crate::{
     EventCallback,
+    NowPlayingOptions,
     model::{
         MetadataPayload,
         PlayModePayload,
@@ -64,10 +65,12 @@ pub struct WindowsImpl {
 
 #[expect(clippy::unused_async)]
 impl WindowsImpl {
-    pub async fn new(hwnd_opt: Option<isize>, callback: EventCallback) -> Result<Self> {
+    pub async fn new(options: &NowPlayingOptions, callback: EventCallback) -> Result<Self> {
         info!("正在初始化 SMTC...");
 
-        let hwnd = hwnd_opt.ok_or_else(|| anyhow::anyhow!("Windows 环境下必须提供有效的 HWND"))?;
+        let hwnd = options
+            .hwnd
+            .ok_or_else(|| anyhow::anyhow!("Windows 环境下必须提供有效的 HWND"))?;
 
         let interop =
             factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>()?;
