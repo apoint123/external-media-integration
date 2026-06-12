@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use tracing::{
     debug,
@@ -50,8 +52,6 @@ use crate::{
         TimelinePayload,
     },
 };
-
-const HNS_PER_MILLISECOND: f64 = 10_000.0;
 
 pub struct WindowsImpl {
     smtc: SystemMediaTransportControls,
@@ -137,10 +137,10 @@ impl WindowsImpl {
         let seek_handler = TypedEventHandler::new(
             move |_, args: Ref<PlaybackPositionChangeRequestedEventArgs>| {
                 if let Some(args) = args.as_ref() {
-                    let position_ms =
-                        (args.RequestedPlaybackPosition()?.Duration as f64) / HNS_PER_MILLISECOND;
-                    debug!(position_ms, "SMTC 请求跳转播放位置");
-                    cb_clone(SystemMediaEvent::seek(position_ms));
+                    let hns = args.RequestedPlaybackPosition()?.Duration;
+                    let position = Duration::from_hns(hns.cast_unsigned());
+                    debug!(?position, "SMTC 请求跳转播放位置");
+                    cb_clone(SystemMediaEvent::seek(position));
                 }
                 Ok(())
             },
@@ -256,17 +256,17 @@ impl WindowsImpl {
         }
 
         trace!(
-            payload.current_time,
-            payload.total_time, "正在更新 SMTC 时间线"
+            current_time = ?payload.current_time,
+            total_time = ?payload.total_time, "正在更新 SMTC 时间线"
         );
 
         let props = SystemMediaTransportControlsTimelineProperties::new()?;
         props.SetStartTime(TimeSpan { Duration: 0 })?;
         props.SetPosition(TimeSpan {
-            Duration: (payload.current_time * HNS_PER_MILLISECOND) as i64,
+            Duration: (payload.current_time.as_hns()) as i64,
         })?;
         props.SetEndTime(TimeSpan {
-            Duration: (payload.total_time * HNS_PER_MILLISECOND) as i64,
+            Duration: (payload.total_time.as_hns()) as i64,
         })?;
         self.smtc.UpdateTimelineProperties(&props)?;
         Ok(())
@@ -331,4 +331,26 @@ async fn get_cover_stream_ref(
     Ok(Some(RandomAccessStreamReference::CreateFromStream(
         &stream,
     )?))
+}
+
+const HNS_PER_SEC: u64 = 10_000_000;
+const NANOS_PER_HNS: u32 = 100;
+
+pub trait WindowsTimeExt {
+    fn from_hns(hns: u64) -> Self;
+
+    fn as_hns(&self) -> u128;
+}
+
+impl WindowsTimeExt for Duration {
+    fn from_hns(hns: u64) -> Self {
+        let secs = hns / HNS_PER_SEC;
+        let nanos = (hns % HNS_PER_SEC) as u32 * NANOS_PER_HNS;
+
+        Self::new(secs, nanos)
+    }
+
+    fn as_hns(&self) -> u128 {
+        self.as_nanos() / u128::from(NANOS_PER_HNS)
+    }
 }

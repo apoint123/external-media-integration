@@ -9,6 +9,7 @@ use std::{
         },
     },
     time::{
+        Duration,
         SystemTime,
         UNIX_EPOCH,
     },
@@ -194,14 +195,17 @@ impl LinuxImpl {
                 .as_micros()
                 .saturating_add(offset.as_micros())
                 .max(0);
-            d(SystemMediaEvent::seek(target_micros as f64 / 1000.0));
+            d(SystemMediaEvent::seek(Duration::from_micros(
+                target_micros as u64,
+            )));
         });
 
         // 绝对跳转
         player.connect_set_position(move |_, trackid, position| {
             debug!(?position, ?trackid, "收到 set_position 命令");
-            let ms = position.as_micros() as f64 / 1000.0;
-            dispatch(SystemMediaEvent::seek(ms));
+            dispatch(SystemMediaEvent::seek(Duration::from_micros(
+                position.as_micros() as u64,
+            )));
         });
     }
 
@@ -283,7 +287,7 @@ impl LinuxImpl {
         }
 
         if let Some(dur) = payload.duration {
-            mb = mb.length(Time::from_millis(dur as i64));
+            mb = mb.length(Time::from_micros(dur.as_micros() as i64));
         }
 
         if let Some(url) = art_url {
@@ -327,7 +331,7 @@ impl LinuxImpl {
         if !self.is_enabled.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let pos = Time::from_millis(payload.current_time as i64);
+        let pos = Time::from_micros(payload.current_time.as_micros() as i64);
         self.player.set_position(pos);
         // seek 操作时发出 Seeked D-Bus 信号，通知外部客户端立即刷新进度
         if payload.seeked.unwrap_or(false) {

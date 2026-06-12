@@ -1,4 +1,5 @@
 use std::time::{
+    Duration,
     SystemTime,
     UNIX_EPOCH,
 };
@@ -16,10 +17,7 @@ use discord_rich_presence::{
         Timestamps,
     },
 };
-use tokio::time::{
-    Duration,
-    Instant,
-};
+use tokio::time::Instant;
 use tracing::{
     debug,
     info,
@@ -43,7 +41,7 @@ const RECONNECT_COOLDOWN_SECONDS: u64 = 5;
 struct ActivityData {
     metadata: MetadataPayload,
     status: PlaybackStatus,
-    current_time: f64,
+    current_time: Duration,
     cached_cover_url: String,
 }
 
@@ -55,7 +53,7 @@ impl ActivityData {
         Self {
             metadata,
             status: PlaybackStatus::Paused,
-            current_time: 0.0,
+            current_time: Duration::ZERO,
             cached_cover_url,
         }
     }
@@ -64,7 +62,7 @@ impl ActivityData {
         self.cached_cover_url =
             Self::process_cover_url(metadata.original_cover_url.as_deref(), default_icon);
         self.metadata = metadata;
-        self.current_time = 0.0;
+        self.current_time = Duration::ZERO;
     }
 
     fn process_cover_url(original_url: Option<&str>, default_icon: &str) -> String {
@@ -277,7 +275,7 @@ impl DiscordAdapter {
 
         match data.status {
             PlaybackStatus::Paused => {
-                if let Some(duration) = data.metadata.duration.filter(|&d| d > 0.0) {
+                if let Some(duration) = data.metadata.duration.filter(|d| !d.is_zero()) {
                     let (start, end) = Self::calc_paused_timestamps(data.current_time, duration);
                     activity = activity
                         .timestamps(Timestamps::new().start(start).end(end))
@@ -291,9 +289,9 @@ impl DiscordAdapter {
                 }
             }
             PlaybackStatus::Playing => {
-                let duration = data.metadata.duration.unwrap_or(0.0);
+                let duration = data.metadata.duration.unwrap_or(Duration::ZERO);
 
-                if duration > 0.0 {
+                if !duration.is_zero() {
                     let (start, end) = Self::calc_playing_timestamps(data.current_time, duration);
                     next_end = Some(end);
 
@@ -373,7 +371,7 @@ impl DiscordAdapter {
         activity
     }
 
-    fn calc_paused_timestamps(current_time: f64, duration: f64) -> (i64, i64) {
+    fn calc_paused_timestamps(current_time: Duration, duration: Duration) -> (i64, i64) {
         // 来自 https://musicpresence.app/ 的 hack，通过将
         // 开始和结束时间戳向后平移一年以实现在暂停时进度静止的效果
         const ONE_YEAR_MS: i64 = 365 * 24 * 60 * 60 * 1000;
@@ -383,14 +381,14 @@ impl DiscordAdapter {
             .unwrap_or_default()
             .as_millis() as i64;
 
-        let current_progress_ms = current_time as i64;
+        let current_progress_ms = current_time.as_millis() as i64;
         let future_start = (now_ms - current_progress_ms) + ONE_YEAR_MS;
-        let future_end = future_start + (duration as i64);
+        let future_end = future_start + duration.as_millis() as i64;
 
         (future_start, future_end)
     }
 
-    fn calc_playing_timestamps(current_time: f64, duration: f64) -> (i64, i64) {
+    fn calc_playing_timestamps(current_time: Duration, duration: Duration) -> (i64, i64) {
         if current_time >= duration {
             return (0, 0);
         }
@@ -400,8 +398,8 @@ impl DiscordAdapter {
             .unwrap_or_default()
             .as_millis() as i64;
 
-        let duration_ms = duration as i64;
-        let current_time_ms = current_time as i64;
+        let duration_ms = duration.as_millis() as i64;
+        let current_time_ms = current_time.as_millis() as i64;
         let remaining_ms = (duration_ms - current_time_ms).max(0);
 
         let end = now_ms + remaining_ms;

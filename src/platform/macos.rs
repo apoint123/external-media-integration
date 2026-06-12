@@ -1,4 +1,7 @@
-use std::ptr::NonNull;
+use std::{
+    ptr::NonNull,
+    time::Duration,
+};
 
 use anyhow::Result;
 use block2::RcBlock;
@@ -193,9 +196,10 @@ impl MacosImpl {
                     .and_then(|evt| evt.downcast::<MPChangePlaybackPositionCommandEvent>().ok());
 
                 if let Some(seek_evt) = seek_evt_opt {
-                    let position_ms = unsafe { seek_evt.positionTime() } * 1000.0;
-                    debug!(position_ms, "MPChangePlaybackPositionCommand 触发");
-                    cb(SystemMediaEvent::seek(position_ms));
+                    let position_secs = unsafe { seek_evt.positionTime() };
+                    let position = Duration::from_secs_f64(position_secs);
+                    debug!(?position, "MPChangePlaybackPositionCommand 触发");
+                    cb(SystemMediaEvent::seek(position));
                 }
                 MPRemoteCommandHandlerStatus::Success
             },
@@ -377,8 +381,8 @@ impl MacosImpl {
             );
 
             // 时长
-            if let Some(duration_ms) = payload.duration {
-                let duration_secs = duration_ms / 1000.0;
+            if let Some(dur) = payload.duration {
+                let duration_secs = dur.as_secs_f64();
                 info.setObject_forKey(
                     &NSNumber::new_f64(duration_secs),
                     ProtocolObject::from_ref(MPMediaItemPropertyPlaybackDuration),
@@ -450,21 +454,21 @@ impl MacosImpl {
 
     pub async fn update_timeline(&mut self, payload: TimelinePayload) -> Result<()> {
         trace!(
-            new_curr = payload.current_time,
-            new_total = payload.total_time,
+            new_curr = ?payload.current_time,
+            new_total = ?payload.total_time,
             "正在更新 MPNowPlayingInfoCenter 时间线"
         );
 
         unsafe {
             // 播放进度
             self.info.setObject_forKey(
-                &NSNumber::new_f64(payload.current_time / 1000.0),
+                &NSNumber::new_f64(payload.current_time.as_secs_f64()),
                 ProtocolObject::from_ref(MPNowPlayingInfoPropertyElapsedPlaybackTime),
             );
 
             // 总时长
             self.info.setObject_forKey(
-                &NSNumber::new_f64(payload.total_time / 1000.0),
+                &NSNumber::new_f64(payload.total_time.as_secs_f64()),
                 ProtocolObject::from_ref(MPMediaItemPropertyPlaybackDuration),
             );
 

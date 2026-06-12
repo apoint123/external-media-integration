@@ -1,4 +1,7 @@
-use std::fmt;
+use std::{
+    fmt,
+    time::Duration,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemMediaEventType {
@@ -18,7 +21,7 @@ pub enum SystemMediaEventType {
 #[derive(Clone, Debug)]
 pub struct SystemMediaEvent {
     pub type_: SystemMediaEventType,
-    pub position_ms: Option<f64>,
+    pub position: Option<Duration>,
     pub rate: Option<f64>,
     pub volume: Option<f64>,
 }
@@ -28,16 +31,16 @@ impl SystemMediaEvent {
     pub const fn new(t: SystemMediaEventType) -> Self {
         Self {
             type_: t,
-            position_ms: None,
+            position: None,
             rate: None,
             volume: None,
         }
     }
     #[must_use]
-    pub const fn seek(pos: f64) -> Self {
+    pub const fn seek(position: Duration) -> Self {
         Self {
             type_: SystemMediaEventType::Seek,
-            position_ms: Some(pos),
+            position: Some(position),
             rate: None,
             volume: None,
         }
@@ -46,7 +49,7 @@ impl SystemMediaEvent {
     pub const fn set_rate(rate: f64) -> Self {
         Self {
             type_: SystemMediaEventType::SetRate,
-            position_ms: None,
+            position: None,
             rate: Some(rate),
             volume: None,
         }
@@ -56,14 +59,14 @@ impl SystemMediaEvent {
     pub const fn set_volume(volume: f64) -> Self {
         Self {
             type_: SystemMediaEventType::SetVolume,
-            position_ms: None,
+            position: None,
             rate: None,
             volume: Some(volume),
         }
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MetadataPayload {
     pub song_name: String,
     pub author_name: String,
@@ -88,11 +91,11 @@ pub struct MetadataPayload {
     /// Discord RPC 按钮。最多支持 2 个，超出部分将被自动忽略
     pub discord_buttons: Option<Vec<DiscordButton>>,
 
-    /// 当前歌曲时长，单位是毫秒
+    /// 当前歌曲时长
     ///
     /// 用于 Linux、MacOS、Discord RPC 的元数据更新。Windows 使用 [`TimelinePayload`] 的
     /// `total_time` 字段。
-    pub duration: Option<f64>,
+    pub duration: Option<Duration>,
 }
 
 impl fmt::Debug for MetadataPayload {
@@ -137,11 +140,9 @@ pub struct PlayStatePayload {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TimelinePayload {
-    /// 单位是毫秒
-    pub current_time: f64,
+    pub current_time: Duration,
 
-    /// 单位是毫秒
-    pub total_time: f64,
+    pub total_time: Duration,
 
     /// 是否为 seek 操作触发的更新
     pub seeked: Option<bool>,
