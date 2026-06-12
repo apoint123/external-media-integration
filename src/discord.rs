@@ -1,37 +1,43 @@
-use std::{
-    sync::{
-        LazyLock, Mutex,
-        mpsc::{self, Receiver, Sender},
-    },
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+use std::time::{
+    SystemTime,
+    UNIX_EPOCH,
 };
 
+use anyhow::Result;
 use discord_rich_presence::{
-    DiscordIpc, DiscordIpcClient,
-    activity::{Activity, ActivityType, Assets, Button, StatusDisplayType, Timestamps},
+    DiscordIpc,
+    DiscordIpcClient,
+    activity::{
+        Activity,
+        ActivityType,
+        Assets,
+        Button,
+        StatusDisplayType,
+        Timestamps,
+    },
 };
-use tracing::{debug, info, warn};
+use tokio::time::{
+    Duration,
+    Instant,
+};
+use tracing::{
+    debug,
+    info,
+    warn,
+};
 
 use crate::model::{
-    DiscordConfigPayload, DiscordDisplayMode, DiscordOptions, MetadataPayload, PlayStatePayload,
-    PlaybackStatus, TimelinePayload,
+    DiscordConfigPayload,
+    DiscordDisplayMode,
+    DiscordOptions,
+    MetadataPayload,
+    PlayStatePayload,
+    PlaybackStatus,
+    TimelinePayload,
 };
 
-// 主要用来应对跳转进度的更新
 const TIMESTAMP_UPDATE_THRESHOLD_MS: i64 = 100;
-const RECONNECT_COOLDOWN_SECONDS: u8 = 5;
-
-enum RpcMessage {
-    Metadata(MetadataPayload),
-    PlayState(PlayStatePayload),
-    Timeline(TimelinePayload),
-    Enable,
-    Disable,
-    Config(DiscordConfigPayload),
-}
-
-static SENDER: LazyLock<Mutex<Option<Sender<RpcMessage>>>> = LazyLock::new(|| Mutex::new(None));
+const RECONNECT_COOLDOWN_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq)]
 struct ActivityData {
@@ -75,12 +81,12 @@ impl ActivityData {
 }
 
 #[derive(Debug)]
-struct RpcWorker {
-    options: DiscordOptions,
+pub struct DiscordAdapter {
+    options: Option<DiscordOptions>,
     client: Option<DiscordIpcClient>,
     data: Option<ActivityData>,
     is_enabled: bool,
-    connect_retry_count: u8,
+    next_retry_time: Option<Instant>,
     // 上次发送的结束时间戳
     // 用于防抖，也用于判断是否要清除 Activity
     last_sent_end_timestamp: Option<i64>,
@@ -88,75 +94,91 @@ struct RpcWorker {
     display_mode: DiscordDisplayMode,
 }
 
-impl RpcWorker {
-    const fn new(options: DiscordOptions) -> Self {
+#[allow(clippy::unused_async)]
+impl DiscordAdapter {
+    pub const fn new(options: Option<DiscordOptions>) -> Self {
         Self {
             options,
             client: None,
             data: None,
             is_enabled: false,
-            connect_retry_count: 0,
+            next_retry_time: None,
             last_sent_end_timestamp: None,
             show_when_paused: false,
             display_mode: DiscordDisplayMode::Name,
         }
     }
 
-    fn handle_message(&mut self, msg: RpcMessage) {
-        match msg {
-            RpcMessage::Enable => {
-                info!("启用 Discord RPC");
-                self.is_enabled = true;
-                self.connect_retry_count = 0;
-            }
-            RpcMessage::Disable => {
-                info!("禁用 Discord RPC");
-                self.is_enabled = false;
-                self.disconnect();
-            }
-            RpcMessage::Config(payload) => {
-                info!(
-                    show_when_paused = ?payload.show_when_paused,
-                    display_mode = ?payload.display_mode,
-                    "更新 Discord 配置",
-                );
-                self.show_when_paused = payload.show_when_paused;
+    pub async fn enable(&mut self) -> Result<()> {
+        info!("启用 Discord RPC");
+        self.is_enabled = true;
+        self.next_retry_time = None;
+        self.sync_discord();
+        Ok(())
+    }
 
-                if let Some(mode) = payload.display_mode {
-                    self.display_mode = mode;
-                }
+    pub async fn disable(&mut self) -> Result<()> {
+        info!("禁用 Discord RPC");
+        self.is_enabled = false;
+        self.disconnect();
+        Ok(())
+    }
 
-                self.last_sent_end_timestamp = None;
-            }
-            RpcMessage::Metadata(payload) => {
-                let new_data = match self.data.take() {
-                    Some(mut d) => {
-                        d.update_metadata(payload, &self.options.default_icon_asset_key);
-                        d
-                    }
-                    None => {
-                        ActivityData::from_metadata(payload, &self.options.default_icon_asset_key)
-                    }
-                };
-                self.data = Some(new_data);
-                self.last_sent_end_timestamp = None;
-            }
-            RpcMessage::PlayState(payload) => {
-                if let Some(data) = &mut self.data {
-                    if payload.status == PlaybackStatus::Playing
-                        && data.status != PlaybackStatus::Playing
-                    {
-                        self.last_sent_end_timestamp = None;
-                    }
-                    data.status = payload.status;
-                }
-            }
-            RpcMessage::Timeline(payload) => {
-                if let Some(data) = &mut self.data {
-                    data.current_time = payload.current_time;
-                }
-            }
+    /// 处理断线重连等后台任务
+    pub async fn tick(&mut self) {
+        if self.is_enabled && self.client.is_none() {
+            self.sync_discord();
         }
+    }
+
+    pub async fn update_config(&mut self, payload: DiscordConfigPayload) -> Result<()> {
+        info!(show_when_paused = ?payload.show_when_paused, display_mode = ?payload.display_mode, "更新 Discord 配置");
+        self.show_when_paused = payload.show_when_paused;
+
+        if let Some(mode) = payload.display_mode {
+            self.display_mode = mode;
+        }
+
+        self.last_sent_end_timestamp = None;
+        self.sync_discord();
+        Ok(())
+    }
+
+    pub async fn update_metadata(&mut self, payload: MetadataPayload) -> Result<()> {
+        let default_icon = self
+            .options
+            .as_ref()
+            .map_or("", |o| o.default_icon_asset_key.as_str());
+        match &mut self.data {
+            Some(d) => d.update_metadata(payload, default_icon),
+            None => self.data = Some(ActivityData::from_metadata(payload, default_icon)),
+        }
+        self.last_sent_end_timestamp = None;
+        self.sync_discord();
+        Ok(())
+    }
+
+    pub async fn update_play_state(&mut self, payload: PlayStatePayload) -> Result<()> {
+        if let Some(data) = &mut self.data {
+            if payload.status == PlaybackStatus::Playing && data.status != PlaybackStatus::Playing {
+                self.last_sent_end_timestamp = None;
+            }
+            data.status = payload.status;
+            self.sync_discord();
+        }
+        Ok(())
+    }
+
+    pub async fn update_timeline(&mut self, payload: TimelinePayload) -> Result<()> {
+        if let Some(data) = &mut self.data {
+            data.current_time = payload.current_time;
+            self.sync_discord();
+        }
+        Ok(())
+    }
+
+    pub fn shutdown(&mut self) {
+        self.disconnect();
     }
 
     fn disconnect(&mut self) {
@@ -166,28 +188,37 @@ impl RpcWorker {
         self.last_sent_end_timestamp = None;
     }
 
-    fn connect(&mut self) {
-        if self.connect_retry_count > 0 {
-            self.connect_retry_count -= 1;
-            return;
+    fn connect(&mut self) -> bool {
+        let Some(opts) = &self.options else {
+            return false;
+        };
+
+        if let Some(retry_time) = self.next_retry_time
+            && Instant::now() < retry_time
+        {
+            return false;
         }
 
-        let mut client = DiscordIpcClient::new(&self.options.app_id);
+        let mut client = DiscordIpcClient::new(&opts.app_id);
         match client.connect() {
             Ok(()) => {
                 info!("Discord IPC 已连接");
                 self.client = Some(client);
+                self.next_retry_time = None;
                 self.last_sent_end_timestamp = None;
+                true
             }
             Err(e) => {
                 debug!("连接 Discord IPC 失败: {e:?}. Discord 可能未运行");
-                self.connect_retry_count = RECONNECT_COOLDOWN_SECONDS;
+                self.next_retry_time =
+                    Some(Instant::now() + Duration::from_secs(RECONNECT_COOLDOWN_SECONDS));
+                false
             }
         }
     }
 
     fn sync_discord(&mut self) {
-        if !self.is_enabled {
+        if !self.is_enabled || self.options.is_none() {
             if self.client.is_some() {
                 self.disconnect();
             }
@@ -202,23 +233,105 @@ impl RpcWorker {
             return;
         }
 
-        if self.client.is_none() {
-            self.connect();
+        if self.client.is_none() && !self.connect() {
+            return;
         }
 
-        if let (Some(client), Some(data)) = (&mut self.client, &self.data) {
-            let success = Self::perform_update(
-                client,
-                data,
-                &mut self.last_sent_end_timestamp,
-                self.show_when_paused,
-                self.display_mode,
-                &self.options,
-            );
-            if !success {
-                self.disconnect();
+        if !self.perform_update() {
+            self.disconnect();
+            self.next_retry_time =
+                Some(Instant::now() + Duration::from_secs(RECONNECT_COOLDOWN_SECONDS));
+        }
+    }
+
+    fn perform_update(&mut self) -> bool {
+        let Some(client) = &mut self.client else {
+            return false;
+        };
+        let Some(data) = &self.data else { return true };
+        let Some(options) = &self.options else {
+            return false;
+        };
+
+        let mut activity = Self::build_base_activity(data, self.display_mode, options);
+        let mut new_end_timestamp = None;
+        let should_send;
+
+        match data.status {
+            PlaybackStatus::Paused => {
+                if !self.show_when_paused {
+                    debug!("播放暂停且配置为隐藏，清除 Activity");
+                    if let Err(e) = client.clear_activity() {
+                        warn!("清除 Discord Activity 失败: {e:?}");
+                        return false;
+                    }
+                    self.last_sent_end_timestamp = None;
+                    return true;
+                }
+
+                if let Some(duration) = data.metadata.duration
+                    && duration > 0.0
+                {
+                    let (start, end) = Self::calc_paused_timestamps(data.current_time, duration);
+                    activity = activity
+                        .timestamps(Timestamps::new().start(start).end(end))
+                        .assets(
+                            Assets::new()
+                                .large_image(&data.cached_cover_url)
+                                .large_text(&data.metadata.album_name)
+                                .small_image(&options.default_icon_asset_key)
+                                .small_text("Paused"),
+                        );
+                }
+                should_send = true;
+                self.last_sent_end_timestamp = None;
+            }
+            PlaybackStatus::Playing => {
+                if let Some(duration) = data.metadata.duration {
+                    if duration > 0.0 {
+                        let (start, end) =
+                            Self::calc_playing_timestamps(data.current_time, duration);
+
+                        // 频繁调用 Discord RPC 接口会导致限流，所以在跳转发生时再更新时间戳
+                        if let Some(last_end) = self.last_sent_end_timestamp {
+                            let diff = (last_end - end).abs();
+                            if diff < TIMESTAMP_UPDATE_THRESHOLD_MS {
+                                return true;
+                            }
+                        }
+
+                        activity = activity.timestamps(Timestamps::new().start(start).end(end));
+                        new_end_timestamp = Some(end);
+                        should_send = true;
+                    } else {
+                        should_send = self.last_sent_end_timestamp.is_some();
+                    }
+                } else {
+                    should_send = self.last_sent_end_timestamp.is_some();
+                }
             }
         }
+
+        if should_send {
+            debug!(
+                song = %data.metadata.song_name,
+                state = ?data.status,
+                "更新 Discord Activity"
+            );
+
+            if let Err(e) = client.set_activity(activity) {
+                warn!("设置 Discord Activity 失败: {e:?}, 尝试重连");
+                return false;
+            }
+        }
+
+        if new_end_timestamp.is_some() {
+            self.last_sent_end_timestamp = new_end_timestamp;
+        } else if data.status == PlaybackStatus::Playing && data.metadata.duration.is_none() {
+            self.last_sent_end_timestamp = None;
+        }
+
+        true
     }
 
     fn build_base_activity<'a>(
@@ -297,169 +410,4 @@ impl RpcWorker {
 
         (start, end)
     }
-
-    fn perform_update(
-        client: &mut DiscordIpcClient,
-        data: &ActivityData,
-        last_sent_end_timestamp: &mut Option<i64>,
-        show_when_paused: bool,
-        display_mode: DiscordDisplayMode,
-        options: &DiscordOptions,
-    ) -> bool {
-        let mut activity = Self::build_base_activity(data, display_mode, options);
-        let mut new_end_timestamp = None;
-        let should_send;
-
-        match data.status {
-            PlaybackStatus::Paused => {
-                if !show_when_paused {
-                    debug!("播放暂停且配置为隐藏，清除 Activity");
-                    if let Err(e) = client.clear_activity() {
-                        warn!("清除 Discord Activity 失败: {e:?}");
-                        return false;
-                    }
-                    *last_sent_end_timestamp = None;
-                    return true;
-                }
-
-                if let Some(duration) = data.metadata.duration
-                    && duration > 0.0
-                {
-                    let (start, end) = Self::calc_paused_timestamps(data.current_time, duration);
-
-                    debug!(future_start = start, future_end = end, "应用 hack 时间戳");
-
-                    activity = activity
-                        .timestamps(Timestamps::new().start(start).end(end))
-                        .assets(
-                            Assets::new()
-                                .large_image(&data.cached_cover_url)
-                                .large_text(&data.metadata.album_name)
-                                .small_image(&options.default_icon_asset_key)
-                                .small_text("Paused"),
-                        );
-                }
-
-                should_send = true;
-                *last_sent_end_timestamp = None;
-            }
-            PlaybackStatus::Playing => {
-                if let Some(duration) = data.metadata.duration
-                    && duration > 0.0
-                {
-                    let (start, end) = Self::calc_playing_timestamps(data.current_time, duration);
-
-                    // 频繁调用 Discord RPC 接口会导致限流，所以在跳转发生时再更新时间戳
-                    if let Some(last_end) = last_sent_end_timestamp {
-                        let diff = (*last_end - end).abs();
-                        if diff < TIMESTAMP_UPDATE_THRESHOLD_MS {
-                            return true;
-                        }
-                        debug!(
-                            diff_ms = diff,
-                            threshold_ms = TIMESTAMP_UPDATE_THRESHOLD_MS,
-                            "进度变更超过阈值，触发更新"
-                        );
-                    }
-
-                    activity = activity.timestamps(Timestamps::new().start(start).end(end));
-                    new_end_timestamp = Some(end);
-                    should_send = true;
-                } else {
-                    should_send = last_sent_end_timestamp.is_some();
-                    if should_send {
-                        warn!("没有时长，清除时间戳");
-                    }
-                }
-            }
-        }
-
-        if should_send {
-            debug!(
-                song = %data.metadata.song_name,
-                state = ?data.status,
-                "更新 Discord Activity"
-            );
-
-            if let Err(e) = client.set_activity(activity) {
-                warn!("设置 Discord Activity 失败: {e:?}, 尝试重连");
-                return false;
-            }
-        }
-
-        if new_end_timestamp.is_some() {
-            *last_sent_end_timestamp = new_end_timestamp;
-        } else if matches!(data.status, PlaybackStatus::Playing) && data.metadata.duration.is_none()
-        {
-            *last_sent_end_timestamp = None;
-        }
-
-        true
-    }
-}
-
-fn background_loop(rx: &Receiver<RpcMessage>, options: DiscordOptions) {
-    let mut worker = RpcWorker::new(options);
-
-    loop {
-        match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(msg) => {
-                worker.handle_message(msg);
-                worker.sync_discord();
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if worker.client.is_none() {
-                    worker.sync_discord();
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-}
-
-pub fn init(options: Option<DiscordOptions>) {
-    let Some(opts) = options else {
-        info!("未提供 Discord 配置，Discord RPC 已被禁用");
-        return;
-    };
-
-    let (tx, rx) = mpsc::channel();
-    if let Ok(mut guard) = SENDER.lock() {
-        *guard = Some(tx);
-    }
-    thread::spawn(move || {
-        background_loop(&rx, opts);
-    });
-}
-
-fn send(msg: RpcMessage) {
-    if let Ok(guard) = SENDER.lock()
-        && let Some(tx) = guard.as_ref()
-        && let Err(e) = tx.send(msg)
-    {
-        warn!("向 Discord RPC 线程发送消息失败: {e}");
-    }
-}
-
-pub fn enable() {
-    send(RpcMessage::Enable);
-}
-
-pub fn disable() {
-    send(RpcMessage::Disable);
-}
-
-pub fn update_config(payload: DiscordConfigPayload) {
-    send(RpcMessage::Config(payload));
-}
-
-pub fn update_metadata(payload: MetadataPayload) {
-    send(RpcMessage::Metadata(payload));
-}
-pub fn update_play_state(payload: PlayStatePayload) {
-    send(RpcMessage::PlayState(payload));
-}
-
-pub fn update_timeline(payload: TimelinePayload) {
-    send(RpcMessage::Timeline(payload));
 }

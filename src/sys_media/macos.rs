@@ -1,86 +1,149 @@
-use std::{
-    ptr::NonNull,
-    sync::{Arc, Mutex},
-};
+use std::ptr::NonNull;
 
 use anyhow::Result;
 use block2::RcBlock;
 use objc2::{
-    AnyThread, Message,
+    AnyThread as _,
+    Message as _,
     rc::Retained,
-    runtime::{AnyObject, ProtocolObject},
+    runtime::{
+        AnyObject,
+        ProtocolObject,
+    },
 };
 use objc2_app_kit::NSImage;
-use objc2_foundation::{NSArray, NSData, NSMutableDictionary, NSNumber, NSSize, NSString};
+use objc2_foundation::{
+    NSArray,
+    NSData,
+    NSMutableDictionary,
+    NSNumber,
+    NSSize,
+    NSString,
+};
 use objc2_media_player::{
-    MPChangePlaybackPositionCommandEvent, MPChangePlaybackRateCommandEvent,
-    MPChangeRepeatModeCommandEvent, MPChangeShuffleModeCommandEvent, MPMediaItemArtwork,
-    MPMediaItemPropertyAlbumTitle, MPMediaItemPropertyArtist, MPMediaItemPropertyArtwork,
-    MPMediaItemPropertyGenre, MPMediaItemPropertyPersistentID, MPMediaItemPropertyPlaybackDuration,
-    MPMediaItemPropertyTitle, MPNowPlayingInfoCenter, MPNowPlayingInfoPropertyElapsedPlaybackTime,
-    MPNowPlayingInfoPropertyPlaybackRate, MPNowPlayingPlaybackState, MPRemoteCommand,
-    MPRemoteCommandCenter, MPRemoteCommandEvent, MPRemoteCommandHandlerStatus, MPRepeatType,
+    MPChangePlaybackPositionCommandEvent,
+    MPChangePlaybackRateCommandEvent,
+    MPChangeRepeatModeCommandEvent,
+    MPChangeShuffleModeCommandEvent,
+    MPMediaItemArtwork,
+    MPMediaItemPropertyAlbumTitle,
+    MPMediaItemPropertyArtist,
+    MPMediaItemPropertyArtwork,
+    MPMediaItemPropertyGenre,
+    MPMediaItemPropertyPersistentID,
+    MPMediaItemPropertyPlaybackDuration,
+    MPMediaItemPropertyTitle,
+    MPNowPlayingInfoCenter,
+    MPNowPlayingInfoPropertyElapsedPlaybackTime,
+    MPNowPlayingInfoPropertyPlaybackRate,
+    MPNowPlayingPlaybackState,
+    MPRemoteCommand,
+    MPRemoteCommandCenter,
+    MPRemoteCommandEvent,
+    MPRemoteCommandHandlerStatus,
+    MPRepeatType,
     MPShuffleType,
 };
-use tracing::{debug, error, trace};
+use tracing::{
+    debug,
+    trace,
+};
 
 use crate::{
+    EventCallback,
     model::{
-        MetadataPayload, PlayModePayload, PlayStatePayload, PlaybackStatus, SystemMediaEvent,
-        SystemMediaEventType, TimelinePayload,
+        MetadataPayload,
+        PlayModePayload,
+        PlayStatePayload,
+        PlaybackStatus,
+        SystemMediaEvent,
+        SystemMediaEventType,
+        TimelinePayload,
     },
-    sys_media::{EventCallback, SystemMediaControls},
 };
 
 pub struct MacosImpl {
     np_info_ctr: Retained<MPNowPlayingInfoCenter>,
     cmd_ctr: Retained<MPRemoteCommandCenter>,
-    info: Mutex<Retained<NSMutableDictionary<NSString, AnyObject>>>,
-    event_handler: Arc<Mutex<Option<EventCallback>>>,
-    target_tokens: Mutex<Vec<(Retained<MPRemoteCommand>, Retained<AnyObject>)>>,
+    info: Retained<NSMutableDictionary<NSString, AnyObject>>,
+    target_tokens: Vec<(Retained<MPRemoteCommand>, Retained<AnyObject>)>,
 }
 
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl Send for MacosImpl {}
-unsafe impl Sync for MacosImpl {}
-
+#[expect(clippy::unused_async, clippy::future_not_send)]
 impl MacosImpl {
-    pub fn new() -> Self {
+    pub async fn new(_hwnd: Option<isize>, callback: EventCallback) -> Result<Self> {
+        let np_info_ctr = unsafe { MPNowPlayingInfoCenter::defaultCenter() };
+        let cmd_ctr = unsafe { MPRemoteCommandCenter::sharedCommandCenter() };
+        let info = NSMutableDictionary::new();
+
+        let mut instance = Self {
+            np_info_ctr,
+            cmd_ctr,
+            info,
+            target_tokens: Vec::new(),
+        };
+
+        instance.setup_event_listeners(&callback);
+
+        Ok(instance)
+    }
+
+    fn store_token(&mut self, command: &MPRemoteCommand, token: Retained<AnyObject>) {
+        self.target_tokens.push((command.retain(), token));
+    }
+
+    fn setup_event_listeners(&mut self, callback: &EventCallback) {
         unsafe {
-            let np_info_ctr = MPNowPlayingInfoCenter::defaultCenter();
-            let cmd_ctr = MPRemoteCommandCenter::sharedCommandCenter();
-            let info = NSMutableDictionary::new();
-
-            Self {
-                np_info_ctr,
-                cmd_ctr,
-                info: Mutex::new(info),
-                event_handler: Arc::new(Mutex::new(None)),
-                target_tokens: Mutex::new(Vec::new()),
-            }
+            // 播放
+            self.add_simple_handler(
+                &self.cmd_ctr.playCommand(),
+                SystemMediaEventType::Play,
+                callback,
+            );
+            // 暂停
+            self.add_simple_handler(
+                &self.cmd_ctr.pauseCommand(),
+                SystemMediaEventType::Pause,
+                callback,
+            );
+            // 上一首
+            self.add_simple_handler(
+                &self.cmd_ctr.previousTrackCommand(),
+                SystemMediaEventType::PreviousSong,
+                callback,
+            );
+            // 下一首
+            self.add_simple_handler(
+                &self.cmd_ctr.nextTrackCommand(),
+                SystemMediaEventType::NextSong,
+                callback,
+            );
+            // 停止
+            self.add_simple_handler(
+                &self.cmd_ctr.stopCommand(),
+                SystemMediaEventType::Stop,
+                callback,
+            );
         }
+
+        self.add_toggle_handler(callback);
+        self.add_seek_handler(callback);
+        self.add_rate_handler(callback);
+        self.add_shuffle_handler(callback);
+        self.add_repeat_handler(callback);
     }
 
-    fn store_token(&self, command: &MPRemoteCommand, token: Retained<AnyObject>) {
-        if let Ok(mut tokens) = self.target_tokens.lock() {
-            tokens.push((command.retain(), token));
-        } else {
-            error!("无法锁定 target_tokens，token 可能泄漏");
-        }
-    }
-
-    fn add_command_handler(&self, command: &MPRemoteCommand, event_type: SystemMediaEventType) {
-        let handler_arc = self.event_handler.clone();
-
+    fn add_simple_handler(
+        &mut self,
+        command: &MPRemoteCommand,
+        event_type: SystemMediaEventType,
+        callback: &EventCallback,
+    ) {
+        let cb = callback.clone();
         let block = RcBlock::new(
             move |_: NonNull<MPRemoteCommandEvent>| -> MPRemoteCommandHandlerStatus {
-                if let Ok(guard) = handler_arc.lock()
-                    && let Some(cb) = guard.as_ref()
-                {
-                    debug!(?event_type, "MPRemoteCommand 触发");
-                    let evt = SystemMediaEvent::new(event_type);
-                    cb(evt);
-                }
+                debug!(?event_type, "MPRemoteCommand 触发");
+                cb(SystemMediaEvent::new(event_type));
                 MPRemoteCommandHandlerStatus::Success
             },
         );
@@ -92,9 +155,10 @@ impl MacosImpl {
         }
     }
 
-    fn add_toggle_handler(&self) {
+    fn add_toggle_handler(&mut self, callback: &EventCallback) {
         let command = unsafe { self.cmd_ctr.togglePlayPauseCommand() };
-        let handler_arc = self.event_handler.clone();
+        let cb = callback.clone();
+
         let info_ctr = self.np_info_ctr.clone();
 
         let block = RcBlock::new(move |_| -> MPRemoteCommandHandlerStatus {
@@ -106,13 +170,8 @@ impl MacosImpl {
                 SystemMediaEventType::Play
             };
 
-            if let Ok(guard) = handler_arc.lock()
-                && let Some(cb) = guard.as_ref()
-            {
-                debug!(?event_type, "MPRemoteCommand Toggle 触发");
-                let evt = SystemMediaEvent::new(event_type);
-                cb(evt);
-            }
+            debug!(?event_type, "MPRemoteCommand Toggle 触发");
+            cb(SystemMediaEvent::new(event_type));
             MPRemoteCommandHandlerStatus::Success
         });
 
@@ -123,9 +182,9 @@ impl MacosImpl {
         }
     }
 
-    fn add_seek_handler(&self) {
+    fn add_seek_handler(&mut self, callback: &EventCallback) {
         let command = unsafe { self.cmd_ctr.changePlaybackPositionCommand() };
-        let handler_arc = self.event_handler.clone();
+        let cb = callback.clone();
 
         let block = RcBlock::new(
             move |event: NonNull<MPRemoteCommandEvent>| -> MPRemoteCommandHandlerStatus {
@@ -133,19 +192,10 @@ impl MacosImpl {
                     .and_then(|evt| evt.downcast::<MPChangePlaybackPositionCommandEvent>().ok());
 
                 if let Some(seek_evt) = seek_evt_opt {
-                    let position_seconds = unsafe { seek_evt.positionTime() };
-                    let position_ms = position_seconds * 1000.0;
-
+                    let position_ms = unsafe { seek_evt.positionTime() } * 1000.0;
                     debug!(position_ms, "MPChangePlaybackPositionCommand 触发");
-
-                    if let Ok(guard) = handler_arc.lock()
-                        && let Some(cb) = guard.as_ref()
-                    {
-                        let evt = SystemMediaEvent::seek(position_ms);
-                        cb(evt);
-                    }
+                    cb(SystemMediaEvent::seek(position_ms));
                 }
-
                 MPRemoteCommandHandlerStatus::Success
             },
         );
@@ -157,9 +207,9 @@ impl MacosImpl {
         }
     }
 
-    fn add_change_playback_rate_handler(&self) {
+    fn add_rate_handler(&mut self, callback: &EventCallback) {
         let command = unsafe { self.cmd_ctr.changePlaybackRateCommand() };
-        let handler_arc = self.event_handler.clone();
+        let cb = callback.clone();
 
         let block = RcBlock::new(
             move |event: NonNull<MPRemoteCommandEvent>| -> MPRemoteCommandHandlerStatus {
@@ -169,22 +219,14 @@ impl MacosImpl {
                 if let Some(rate_evt) = rate_evt_opt {
                     let rate = unsafe { rate_evt.playbackRate() };
                     debug!(rate, "MPChangePlaybackRateCommand 触发");
-
-                    if let Ok(guard) = handler_arc.lock()
-                        && let Some(cb) = guard.as_ref()
-                    {
-                        let evt = SystemMediaEvent::set_rate(f64::from(rate));
-                        cb(evt);
-                    }
+                    cb(SystemMediaEvent::set_rate(f64::from(rate)));
                 }
-
                 MPRemoteCommandHandlerStatus::Success
             },
         );
 
         unsafe {
             command.setEnabled(true);
-            // 这里可以设置 supportedPlaybackRates，但如果不设置，系统可能会提供默认选项或允许任意值
             let rates = NSArray::from_retained_slice(&[
                 NSNumber::new_f64(0.25),
                 NSNumber::new_f64(0.5),
@@ -202,19 +244,15 @@ impl MacosImpl {
         }
     }
 
-    fn add_shuffle_handler(&self) {
+    fn add_shuffle_handler(&mut self, callback: &EventCallback) {
         let command = unsafe { self.cmd_ctr.changeShuffleModeCommand() };
-        let handler_arc = self.event_handler.clone();
+        let cb = callback.clone();
 
         let block = RcBlock::new(
             move |event: NonNull<MPRemoteCommandEvent>| -> MPRemoteCommandHandlerStatus {
-                let raw_evt = unsafe { Retained::retain(event.as_ptr()) };
-
-                if raw_evt
+                if unsafe { Retained::retain(event.as_ptr()) }
                     .and_then(|e| e.downcast::<MPChangeShuffleModeCommandEvent>().ok())
                     .is_some()
-                    && let Ok(guard) = handler_arc.lock()
-                    && let Some(cb) = guard.as_ref()
                 {
                     debug!("MPChangeShuffleModeCommand 触发");
                     cb(SystemMediaEvent::new(SystemMediaEventType::ToggleShuffle));
@@ -230,19 +268,15 @@ impl MacosImpl {
         }
     }
 
-    fn add_repeat_handler(&self) {
+    fn add_repeat_handler(&mut self, callback: &EventCallback) {
         let command = unsafe { self.cmd_ctr.changeRepeatModeCommand() };
-        let handler_arc = self.event_handler.clone();
+        let cb = callback.clone();
 
         let block = RcBlock::new(
             move |event: NonNull<MPRemoteCommandEvent>| -> MPRemoteCommandHandlerStatus {
-                let raw_evt = unsafe { Retained::retain(event.as_ptr()) };
-
-                if raw_evt
+                if unsafe { Retained::retain(event.as_ptr()) }
                     .and_then(|e| e.downcast::<MPChangeRepeatModeCommandEvent>().ok())
                     .is_some()
-                    && let Ok(guard) = handler_arc.lock()
-                    && let Some(cb) = guard.as_ref()
                 {
                     debug!("MPChangeRepeatModeCommand 触发");
                     cb(SystemMediaEvent::new(SystemMediaEventType::ToggleRepeat));
@@ -258,7 +292,7 @@ impl MacosImpl {
         }
     }
 
-    fn set_commands_enabled(&self, enabled: bool) {
+    fn set_commands_enabled(&mut self, enabled: bool) {
         unsafe {
             self.cmd_ctr.playCommand().setEnabled(enabled);
             self.cmd_ctr.pauseCommand().setEnabled(enabled);
@@ -275,121 +309,29 @@ impl MacosImpl {
         }
     }
 
-    fn setup_event_listeners(&self) {
-        unsafe {
-            // 播放
-            self.add_command_handler(&self.cmd_ctr.playCommand(), SystemMediaEventType::Play);
-
-            // 暂停
-            self.add_command_handler(&self.cmd_ctr.pauseCommand(), SystemMediaEventType::Pause);
-
-            // 播放暂停
-            self.add_toggle_handler();
-
-            // 上一首
-            self.add_command_handler(
-                &self.cmd_ctr.previousTrackCommand(),
-                SystemMediaEventType::PreviousSong,
-            );
-
-            // 下一首
-            self.add_command_handler(
-                &self.cmd_ctr.nextTrackCommand(),
-                SystemMediaEventType::NextSong,
-            );
-
-            // 停止
-            self.add_command_handler(&self.cmd_ctr.stopCommand(), SystemMediaEventType::Stop);
-        }
-
-        // Seek
-        self.add_seek_handler();
-
-        // 速率
-        self.add_change_playback_rate_handler();
-
-        // 随机和循环
-        self.add_shuffle_handler();
-        self.add_repeat_handler();
-    }
-}
-
-impl Drop for MacosImpl {
-    fn drop(&mut self) {
-        let _ = self.shutdown();
-    }
-}
-
-impl SystemMediaControls for MacosImpl {
-    fn initialize(&self, _hwnd: Option<isize>) -> Result<()> {
-        // macOS 上不用初始化
-        Ok(())
-    }
-
-    fn enable(&self) -> Result<()> {
+    pub async fn enable(&mut self) -> Result<()> {
         self.set_commands_enabled(true);
         Ok(())
     }
 
-    fn disable(&self) -> Result<()> {
+    pub async fn disable(&mut self) -> Result<()> {
         self.set_commands_enabled(false);
         Ok(())
     }
 
-    fn shutdown(&self) -> Result<()> {
-        self.set_commands_enabled(false);
-
-        if let Ok(mut tokens) = self.target_tokens.lock() {
-            for (command, token) in tokens.drain(..) {
-                unsafe {
-                    command.removeTarget(Some(&token));
-                }
-            }
-        } else {
-            error!("关闭时无法锁定 target_tokens，handler 可能泄漏");
-        }
-
-        unsafe {
-            self.np_info_ctr.setNowPlayingInfo(None);
-        }
-
-        trace!("销毁了 MacosImpl");
-        Ok(())
-    }
-
-    fn register_event_handler(&self, callback: EventCallback) -> Result<()> {
-        {
-            let mut guard = self
-                .event_handler
-                .lock()
-                .map_err(|e| anyhow::anyhow!("注册事件回调时锁中毒: {e:?}"))?;
-            *guard = Some(callback);
-        }
-
-        self.setup_event_listeners();
-
-        Ok(())
-    }
-
-    fn update_metadata(&self, payload: MetadataPayload) {
+    pub async fn update_metadata(&mut self, payload: MetadataPayload) -> Result<()> {
         debug!(
             title = %payload.song_name,
             artist = %payload.author_name,
             album = %payload.album_name,
             track_id = ?payload.track_id,
-            "正在更新 macOS NowPlayingInfo 元数据"
+            "正在更新 MPNowPlayingInfoCenter 元数据"
         );
-
-        let info = match self.info.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                error!("macOS update_metadata 锁中毒: {e:?}");
-                return;
-            }
-        };
 
         unsafe {
             // 基础文本信息
+            let info = &self.info;
+
             info.setObject_forKey(
                 &NSString::from_str(&payload.song_name),
                 ProtocolObject::from_ref(MPMediaItemPropertyTitle),
@@ -471,12 +413,13 @@ impl SystemMediaControls for MacosImpl {
                 info.removeObjectForKey(MPMediaItemPropertyArtwork);
             }
 
-            self.np_info_ctr.setNowPlayingInfo(Some(&*info));
+            self.np_info_ctr.setNowPlayingInfo(Some(info));
         }
+        Ok(())
     }
 
-    fn update_playback_status(&self, payload: PlayStatePayload) {
-        debug!(new_status = ?payload.status, "正在更新 macOS 播放状态");
+    pub async fn update_play_state(&mut self, payload: PlayStatePayload) -> Result<()> {
+        debug!(new_status = ?payload.status, "正在更新 MPNowPlayingInfoCenter 播放状态");
         let macos_state = match payload.status {
             PlaybackStatus::Playing => MPNowPlayingPlaybackState::Playing,
             PlaybackStatus::Paused => MPNowPlayingPlaybackState::Paused,
@@ -485,73 +428,94 @@ impl SystemMediaControls for MacosImpl {
         unsafe {
             self.np_info_ctr.setPlaybackState(macos_state);
         }
+        Ok(())
     }
 
-    fn update_playback_rate(&self, rate: f64) {
-        if let Ok(mut info_guard) = self.info.lock() {
-            let info = &mut *info_guard;
-            unsafe {
-                info.setObject_forKey(
-                    &NSNumber::new_f64(rate),
-                    ProtocolObject::from_ref(MPNowPlayingInfoPropertyPlaybackRate),
-                );
-                self.np_info_ctr.setNowPlayingInfo(Some(info));
-            }
+    pub async fn update_playback_rate(&mut self, rate: f64) -> Result<()> {
+        trace!(new_rate = rate, "正在更新 MPNowPlayingInfoCenter 播放速率");
+        unsafe {
+            self.info.setObject_forKey(
+                &NSNumber::new_f64(rate),
+                ProtocolObject::from_ref(MPNowPlayingInfoPropertyPlaybackRate),
+            );
+            self.np_info_ctr.setNowPlayingInfo(Some(&self.info));
         }
+        Ok(())
     }
 
-    fn update_volume(&self, _volume: f64) {
-        // 未实现
+    pub async fn update_volume(&self, _volume: f64) -> Result<()> {
+        Ok(())
     }
 
-    fn update_timeline(&self, payload: TimelinePayload) {
-        let current_secs = payload.current_time / 1000.0;
-        let total_secs = payload.total_time / 1000.0;
+    pub async fn update_timeline(&mut self, payload: TimelinePayload) -> Result<()> {
+        trace!(
+            new_curr = payload.current_time,
+            new_total = payload.total_time,
+            "正在更新 MPNowPlayingInfoCenter 时间线"
+        );
 
-        if let Ok(mut info_guard) = self.info.lock() {
-            let info = &mut *info_guard;
+        unsafe {
+            // 播放进度
+            self.info.setObject_forKey(
+                &NSNumber::new_f64(payload.current_time / 1000.0),
+                ProtocolObject::from_ref(MPNowPlayingInfoPropertyElapsedPlaybackTime),
+            );
 
-            unsafe {
-                // 播放进度
-                info.setObject_forKey(
-                    &NSNumber::new_f64(current_secs),
-                    ProtocolObject::from_ref(MPNowPlayingInfoPropertyElapsedPlaybackTime),
-                );
+            // 总时长
+            self.info.setObject_forKey(
+                &NSNumber::new_f64(payload.total_time / 1000.0),
+                ProtocolObject::from_ref(MPMediaItemPropertyPlaybackDuration),
+            );
 
-                // 总时长
-                info.setObject_forKey(
-                    &NSNumber::new_f64(total_secs),
-                    ProtocolObject::from_ref(MPMediaItemPropertyPlaybackDuration),
-                );
-
-                self.np_info_ctr.setNowPlayingInfo(Some(info));
-            }
+            self.np_info_ctr.setNowPlayingInfo(Some(&self.info));
         }
+        Ok(())
     }
 
-    fn update_play_mode(&self, payload: PlayModePayload) {
+    pub async fn update_play_mode(&mut self, payload: PlayModePayload) -> Result<()> {
         debug!(
             is_shuffling = payload.is_shuffling,
             repeat_mode = ?payload.repeat_mode,
-            "正在更新 macOS 播放模式"
+            "正在更新 MPNowPlayingInfoCenter 播放模式"
         );
+
         unsafe {
-            let shuffle_cmd = self.cmd_ctr.changeShuffleModeCommand();
-            // Apple 的这个随机模式感觉不太符合我们的应用
             let shuffle_type = if payload.is_shuffling {
                 MPShuffleType::Items
             } else {
                 MPShuffleType::Off
             };
-            shuffle_cmd.setCurrentShuffleType(shuffle_type);
+            self.cmd_ctr
+                .changeShuffleModeCommand()
+                .setCurrentShuffleType(shuffle_type);
 
-            let repeat_cmd = self.cmd_ctr.changeRepeatModeCommand();
             let repeat_type = match payload.repeat_mode {
                 crate::model::RepeatMode::None => MPRepeatType::Off,
                 crate::model::RepeatMode::Track => MPRepeatType::One,
                 crate::model::RepeatMode::List => MPRepeatType::All,
             };
-            repeat_cmd.setCurrentRepeatType(repeat_type);
+            self.cmd_ctr
+                .changeRepeatModeCommand()
+                .setCurrentRepeatType(repeat_type);
         }
+        Ok(())
+    }
+
+    pub fn shutdown(&mut self) {
+        self.set_commands_enabled(false);
+        for (command, token) in self.target_tokens.drain(..) {
+            unsafe {
+                command.removeTarget(Some(&token));
+            }
+        }
+        unsafe {
+            self.np_info_ctr.setNowPlayingInfo(None);
+        }
+    }
+}
+
+impl Drop for MacosImpl {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
