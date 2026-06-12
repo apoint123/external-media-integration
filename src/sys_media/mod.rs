@@ -16,7 +16,9 @@ pub trait SystemMediaControls: Send + Sync {
     /// 初始化系统集成
     ///
     /// 建立连接，如连接 D-Bus，初始化 Windows COM 组件等
-    fn initialize(&self) -> Result<()>;
+    ///
+    /// `hwnd` 为可选的窗口句柄，在 Windows 平台上必须提供以绑定媒体控件
+    fn initialize(&self, hwnd: Option<isize>) -> Result<()>;
 
     /// 启用系统集成
     ///
@@ -97,7 +99,7 @@ struct NoOpControls;
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 impl SystemMediaControls for NoOpControls {
-    fn initialize(&self) -> Result<()> {
+    fn initialize(&self, _hwnd: Option<isize>) -> Result<()> {
         Ok(())
     }
     fn enable(&self) -> Result<()> {

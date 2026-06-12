@@ -321,7 +321,7 @@ impl Drop for MacosImpl {
 }
 
 impl SystemMediaControls for MacosImpl {
-    fn initialize(&self) -> Result<()> {
+    fn initialize(&self, _hwnd: Option<isize>) -> Result<()> {
         // macOS 上不用初始化
         Ok(())
     }

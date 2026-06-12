@@ -22,7 +22,7 @@ url = "2.5"
 # Windows
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.62"
-features = ["Media_Playback", "Storage_Streams"]
+features = ["Media", "Storage_Streams", "Win32_System_WinRT"]
 
 # Linux
 [target.'cfg(target_os = "linux")'.dependencies]

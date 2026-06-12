@@ -25,11 +25,10 @@ use model::{
 /// ### 备注
 ///
 /// 如果其他 API 调用失败，则只会打印日志并静默失败
-pub fn initialize() -> Result<()> {
+pub fn initialize(hwnd: Option<isize>) -> Result<()> {
     discord::init();
 
-    sys_media::get_platform_controls().initialize()?;
-
+    sys_media::get_platform_controls().initialize(hwnd)?;
     Ok(())
 }
 

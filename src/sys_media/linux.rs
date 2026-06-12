@@ -381,7 +381,7 @@ async fn run_mpris_loop(mut rx: UnboundedReceiver<MprisCommand>) -> Result<()> {
 }
 
 impl SystemMediaControls for LinuxImpl {
-    fn initialize(&self) -> Result<()> {
+    fn initialize(&self, _hwnd: Option<isize>) -> Result<()> {
         // Linux 上不用初始化
         Ok(())
     }

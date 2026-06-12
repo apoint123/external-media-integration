@@ -6,14 +6,15 @@ use tracing::{debug, error, info, instrument, warn};
 use windows::{
     Foundation::{TimeSpan, TypedEventHandler},
     Media::{
-        MediaPlaybackAutoRepeatMode, MediaPlaybackStatus, MediaPlaybackType, Playback::MediaPlayer,
+        MediaPlaybackAutoRepeatMode, MediaPlaybackStatus, MediaPlaybackType,
         PlaybackPositionChangeRequestedEventArgs, PlaybackRateChangeRequestedEventArgs,
         SystemMediaTransportControls, SystemMediaTransportControlsButton,
         SystemMediaTransportControlsButtonPressedEventArgs,
         SystemMediaTransportControlsTimelineProperties,
     },
     Storage::Streams::{DataWriter, InMemoryRandomAccessStream, RandomAccessStreamReference},
-    core::{HSTRING, Ref},
+    Win32::{Foundation::HWND, System::WinRT::ISystemMediaTransportControlsInterop},
+    core::{HSTRING, Ref, factory},
 };
 
 use crate::{
@@ -38,7 +39,7 @@ struct SmtcHandlerTokens {
 }
 
 struct SmtcContext {
-    player: MediaPlayer,
+    smtc: SystemMediaTransportControls,
     tokens: SmtcHandlerTokens,
     callback: Option<EventCallback>,
     cover_task: Option<JoinHandle<()>>,
@@ -46,17 +47,16 @@ struct SmtcContext {
 }
 
 impl SmtcContext {
-    fn smtc(&self) -> Result<SystemMediaTransportControls> {
-        Ok(self.player.SystemMediaTransportControls()?)
-    }
-
     fn remove_handlers(&self) -> Result<()> {
-        let smtc = self.smtc()?;
-        smtc.RemoveButtonPressed(self.tokens.button_pressed)?;
-        smtc.RemoveShuffleEnabledChangeRequested(self.tokens.shuffle_changed)?;
-        smtc.RemoveAutoRepeatModeChangeRequested(self.tokens.repeat_changed)?;
-        smtc.RemovePlaybackPositionChangeRequested(self.tokens.seek_requested)?;
-        smtc.RemovePlaybackRateChangeRequested(self.tokens.playback_rate_changed)?;
+        self.smtc.RemoveButtonPressed(self.tokens.button_pressed)?;
+        self.smtc
+            .RemoveShuffleEnabledChangeRequested(self.tokens.shuffle_changed)?;
+        self.smtc
+            .RemoveAutoRepeatModeChangeRequested(self.tokens.repeat_changed)?;
+        self.smtc
+            .RemovePlaybackPositionChangeRequested(self.tokens.seek_requested)?;
+        self.smtc
+            .RemovePlaybackRateChangeRequested(self.tokens.playback_rate_changed)?;
         Ok(())
     }
 }
@@ -71,9 +71,7 @@ impl Drop for SmtcContext {
             warn!("销毁 SmtcContext 时移除处理器失败: {e:?}");
         }
 
-        if let Ok(smtc) = self.smtc() {
-            let _ = smtc.SetIsEnabled(false);
-        }
+        let _ = self.smtc.SetIsEnabled(false);
     }
 }
 
@@ -150,11 +148,15 @@ impl WindowsImpl {
 impl SystemMediaControls for WindowsImpl {
     #[instrument]
     #[allow(clippy::too_many_lines)] // TODO: 重构以解决此警告
-    fn initialize(&self) -> Result<()> {
+    fn initialize(&self, hwnd: Option<isize>) -> Result<()> {
         info!("正在初始化 SMTC...");
 
-        let player = MediaPlayer::new()?;
-        let smtc = player.SystemMediaTransportControls()?;
+        let hwnd = hwnd.ok_or_else(|| anyhow::anyhow!("Windows 环境下必须提供有效的 HWND"))?;
+
+        let interop =
+            factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>()?;
+
+        let smtc: SystemMediaTransportControls = unsafe { interop.GetForWindow(HWND(hwnd as _)) }?;
 
         smtc.SetIsEnabled(false)?;
         smtc.SetIsPlayEnabled(true)?;
@@ -245,7 +247,7 @@ impl SystemMediaControls for WindowsImpl {
         debug!("SMTC 事件处理器已全部附加");
 
         let context = SmtcContext {
-            player,
+            smtc,
             tokens: SmtcHandlerTokens {
                 button_pressed,
                 shuffle_changed,
@@ -268,14 +270,14 @@ impl SystemMediaControls for WindowsImpl {
     fn enable(&self) -> Result<()> {
         with_smtc_ctx("启用 SMTC", |ctx| {
             ctx.is_enabled = true;
-            Ok(ctx.smtc()?.SetIsEnabled(true)?)
+            Ok(ctx.smtc.SetIsEnabled(true)?)
         })
     }
 
     fn disable(&self) -> Result<()> {
         with_smtc_ctx("禁用 SMTC", |ctx| {
             ctx.is_enabled = false;
-            Ok(ctx.smtc()?.SetIsEnabled(false)?)
+            Ok(ctx.smtc.SetIsEnabled(false)?)
         })
     }
 
@@ -343,8 +345,7 @@ impl SystemMediaControls for WindowsImpl {
                     return Ok(());
                 }
 
-                let smtc = inner_ctx.smtc()?;
-                let updater = smtc.DisplayUpdater()?;
+                let updater = inner_ctx.smtc.DisplayUpdater()?;
                 updater.SetType(MediaPlaybackType::Music)?;
 
                 let props = updater.MusicProperties()?;
@@ -390,8 +391,7 @@ impl SystemMediaControls for WindowsImpl {
                 if !ctx.is_enabled {
                     return Ok(());
                 }
-                let smtc = ctx.smtc()?;
-                smtc.SetPlaybackStatus(win_status)?;
+                ctx.smtc.SetPlaybackStatus(win_status)?;
                 debug!("更新 SMTC 播放状态成功");
                 Ok(())
             });
@@ -409,8 +409,7 @@ impl SystemMediaControls for WindowsImpl {
                 if !ctx.is_enabled {
                     return Ok(());
                 }
-                let smtc = ctx.smtc()?;
-                smtc.SetPlaybackRate(rate)?;
+                ctx.smtc.SetPlaybackRate(rate)?;
                 debug!("更新 SMTC 播放速率成功: {}", rate);
                 Ok(())
             });
@@ -440,7 +439,7 @@ impl SystemMediaControls for WindowsImpl {
 
                 with_smtc_ctx("更新时间线", |ctx| {
                     if ctx.is_enabled {
-                        ctx.smtc()?.UpdateTimelineProperties(&props)?;
+                        ctx.smtc.UpdateTimelineProperties(&props)?;
                     }
                     Ok(())
                 })
@@ -465,15 +464,16 @@ impl SystemMediaControls for WindowsImpl {
                 if !ctx.is_enabled {
                     return Ok(());
                 }
-                let smtc = ctx.smtc()?;
-                smtc.SetShuffleEnabled(is_shuffling)?;
+
+                ctx.smtc.SetShuffleEnabled(is_shuffling)?;
 
                 let repeat_mode_win = match repeat_mode {
                     RepeatMode::Track => MediaPlaybackAutoRepeatMode::Track,
                     RepeatMode::List => MediaPlaybackAutoRepeatMode::List,
                     RepeatMode::None => MediaPlaybackAutoRepeatMode::None,
                 };
-                smtc.SetAutoRepeatMode(repeat_mode_win)?;
+
+                ctx.smtc.SetAutoRepeatMode(repeat_mode_win)?;
                 debug!("更新 SMTC 播放模式成功");
                 Ok(())
             });
