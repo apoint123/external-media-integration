@@ -25,7 +25,7 @@ use crate::{
         PlayStatePayload,
         TimelinePayload,
     },
-    sys_media::PlatformMediaControls,
+    platform::PlatformMediaControls,
 };
 
 #[derive(Debug)]

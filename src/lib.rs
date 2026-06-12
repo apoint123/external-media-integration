@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 mod coordinator;
 mod discord;
 pub mod model;
-mod sys_media;
+mod platform;
 
 use crate::{
     coordinator::Command,
