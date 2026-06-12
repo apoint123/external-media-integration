@@ -92,6 +92,7 @@ pub struct DiscordAdapter {
     last_sent_end_timestamp: Option<i64>,
     show_when_paused: bool,
     display_mode: DiscordDisplayMode,
+    dirty: bool,
 }
 
 #[allow(clippy::unused_async)]
@@ -106,6 +107,7 @@ impl DiscordAdapter {
             last_sent_end_timestamp: None,
             show_when_paused: false,
             display_mode: DiscordDisplayMode::Name,
+            dirty: true,
         }
     }
 
@@ -140,6 +142,7 @@ impl DiscordAdapter {
         }
 
         self.last_sent_end_timestamp = None;
+        self.dirty = true;
         self.sync_discord();
         Ok(())
     }
@@ -154,6 +157,7 @@ impl DiscordAdapter {
             None => self.data = Some(ActivityData::from_metadata(payload, default_icon)),
         }
         self.last_sent_end_timestamp = None;
+        self.dirty = true;
         self.sync_discord();
         Ok(())
     }
@@ -164,6 +168,7 @@ impl DiscordAdapter {
                 self.last_sent_end_timestamp = None;
             }
             data.status = payload.status;
+            self.dirty = true;
             self.sync_discord();
         }
         Ok(())
@@ -248,30 +253,31 @@ impl DiscordAdapter {
         let Some(client) = &mut self.client else {
             return false;
         };
-        let Some(data) = &self.data else { return true };
+        let Some(data) = &self.data else {
+            return true;
+        };
         let Some(options) = &self.options else {
             return false;
         };
 
+        if data.status == PlaybackStatus::Paused && !self.show_when_paused {
+            debug!("播放暂停且配置为隐藏，清除 Activity");
+            if let Err(e) = client.clear_activity() {
+                warn!("清除 Discord Activity 失败: {e:?}");
+                return false;
+            }
+            self.last_sent_end_timestamp = None;
+            self.dirty = false;
+            return true;
+        }
+
         let mut activity = Self::build_base_activity(data, self.display_mode, options);
-        let mut new_end_timestamp = None;
-        let should_send;
+        let mut next_end = None;
+        let mut should_send = self.dirty;
 
         match data.status {
             PlaybackStatus::Paused => {
-                if !self.show_when_paused {
-                    debug!("播放暂停且配置为隐藏，清除 Activity");
-                    if let Err(e) = client.clear_activity() {
-                        warn!("清除 Discord Activity 失败: {e:?}");
-                        return false;
-                    }
-                    self.last_sent_end_timestamp = None;
-                    return true;
-                }
-
-                if let Some(duration) = data.metadata.duration
-                    && duration > 0.0
-                {
+                if let Some(duration) = data.metadata.duration.filter(|&d| d > 0.0) {
                     let (start, end) = Self::calc_paused_timestamps(data.current_time, duration);
                     activity = activity
                         .timestamps(Timestamps::new().start(start).end(end))
@@ -283,31 +289,28 @@ impl DiscordAdapter {
                                 .small_text("Paused"),
                         );
                 }
-                should_send = true;
-                self.last_sent_end_timestamp = None;
             }
             PlaybackStatus::Playing => {
-                if let Some(duration) = data.metadata.duration {
-                    if duration > 0.0 {
-                        let (start, end) =
-                            Self::calc_playing_timestamps(data.current_time, duration);
+                let duration = data.metadata.duration.unwrap_or(0.0);
 
-                        // 频繁调用 Discord RPC 接口会导致限流，所以在跳转发生时再更新时间戳
-                        if let Some(last_end) = self.last_sent_end_timestamp {
-                            let diff = (last_end - end).abs();
-                            if diff < TIMESTAMP_UPDATE_THRESHOLD_MS {
-                                return true;
-                            }
+                if duration > 0.0 {
+                    let (start, end) = Self::calc_playing_timestamps(data.current_time, duration);
+                    next_end = Some(end);
+
+                    // 频繁调用 Discord RPC 接口会导致限流，所以在跳转发生时再更新时间戳
+                    if let Some(last_end) = self.last_sent_end_timestamp {
+                        if (last_end - end).abs() >= TIMESTAMP_UPDATE_THRESHOLD_MS {
+                            should_send = true;
                         }
-
-                        activity = activity.timestamps(Timestamps::new().start(start).end(end));
-                        new_end_timestamp = Some(end);
-                        should_send = true;
                     } else {
-                        should_send = self.last_sent_end_timestamp.is_some();
+                        should_send = true;
                     }
-                } else {
-                    should_send = self.last_sent_end_timestamp.is_some();
+
+                    if should_send {
+                        activity = activity.timestamps(Timestamps::new().start(start).end(end));
+                    }
+                } else if self.last_sent_end_timestamp.is_some() {
+                    should_send = true;
                 }
             }
         }
@@ -323,12 +326,8 @@ impl DiscordAdapter {
                 warn!("设置 Discord Activity 失败: {e:?}, 尝试重连");
                 return false;
             }
-        }
-
-        if new_end_timestamp.is_some() {
-            self.last_sent_end_timestamp = new_end_timestamp;
-        } else if data.status == PlaybackStatus::Playing && data.metadata.duration.is_none() {
-            self.last_sent_end_timestamp = None;
+            self.dirty = false;
+            self.last_sent_end_timestamp = next_end;
         }
 
         true
