@@ -14,12 +14,9 @@ use discord_rich_presence::{
 use tracing::{debug, info, warn};
 
 use crate::model::{
-    DiscordConfigPayload, DiscordDisplayMode, MetadataPayload, PlayStatePayload, PlaybackStatus,
-    TimelinePayload,
+    DiscordConfigPayload, DiscordDisplayMode, DiscordOptions, MetadataPayload, PlayStatePayload,
+    PlaybackStatus, TimelinePayload,
 };
-
-const APP_ID: &str = "1454403710162698293";
-const SP_ICON_ASSET_KEY: &str = "logo-icon";
 
 // 主要用来应对跳转进度的更新
 const TIMESTAMP_UPDATE_THRESHOLD_MS: i64 = 100;
@@ -42,50 +39,36 @@ struct ActivityData {
     status: PlaybackStatus,
     current_time: f64,
     cached_cover_url: String,
-    cached_song_url: Option<String>,
 }
 
 impl ActivityData {
-    fn from_metadata(metadata: MetadataPayload) -> Self {
-        let cached_cover_url = Self::process_cover_url(metadata.original_cover_url.as_deref());
-        let cached_song_url = metadata.discord_button_url.clone();
+    fn from_metadata(metadata: MetadataPayload, default_icon: &str) -> Self {
+        let cached_cover_url =
+            Self::process_cover_url(metadata.original_cover_url.as_deref(), default_icon);
+
         Self {
             metadata,
             status: PlaybackStatus::Paused,
             current_time: 0.0,
             cached_cover_url,
-            cached_song_url,
         }
     }
 
-    fn update_metadata(&mut self, metadata: MetadataPayload) {
-        self.cached_cover_url = Self::process_cover_url(metadata.original_cover_url.as_deref());
-        self.cached_song_url
-            .clone_from(&metadata.discord_button_url);
+    fn update_metadata(&mut self, metadata: MetadataPayload, default_icon: &str) {
+        self.cached_cover_url =
+            Self::process_cover_url(metadata.original_cover_url.as_deref(), default_icon);
         self.metadata = metadata;
         self.current_time = 0.0;
     }
 
-    fn process_cover_url(original_url: Option<&str>) -> String {
+    fn process_cover_url(original_url: Option<&str>, default_icon: &str) -> String {
         original_url.map_or_else(
-            || SP_ICON_ASSET_KEY.to_string(),
+            || default_icon.to_string(),
             |url| {
                 if !url.starts_with("http") {
-                    return SP_ICON_ASSET_KEY.to_string();
+                    return default_icon.to_string();
                 }
-                let url = url.replace("http://", "https://");
-                let base_url = url.split('?').next().unwrap_or(&url);
-
-                // 如果是网易云音乐封面，添加参数
-                if let Ok(url_obj) = url::Url::parse(&url)
-                    && let Some(host) = url_obj.host_str()
-                    && (host == "music.126.net" || host.ends_with(".music.126.net"))
-                {
-                    return format!(
-                        "{base_url}?imageView&enlarge=1&type=jpeg&quality=90&thumbnail=150y150"
-                    );
-                }
-                base_url.to_string()
+                url.replace("http://", "https://")
             },
         )
     }
@@ -93,6 +76,7 @@ impl ActivityData {
 
 #[derive(Debug)]
 struct RpcWorker {
+    options: DiscordOptions,
     client: Option<DiscordIpcClient>,
     data: Option<ActivityData>,
     is_enabled: bool,
@@ -104,9 +88,10 @@ struct RpcWorker {
     display_mode: DiscordDisplayMode,
 }
 
-impl Default for RpcWorker {
-    fn default() -> Self {
+impl RpcWorker {
+    const fn new(options: DiscordOptions) -> Self {
         Self {
+            options,
             client: None,
             data: None,
             is_enabled: false,
@@ -116,9 +101,7 @@ impl Default for RpcWorker {
             display_mode: DiscordDisplayMode::Name,
         }
     }
-}
 
-impl RpcWorker {
     fn handle_message(&mut self, msg: RpcMessage) {
         match msg {
             RpcMessage::Enable => {
@@ -148,10 +131,12 @@ impl RpcWorker {
             RpcMessage::Metadata(payload) => {
                 let new_data = match self.data.take() {
                     Some(mut d) => {
-                        d.update_metadata(payload);
+                        d.update_metadata(payload, &self.options.default_icon_asset_key);
                         d
                     }
-                    None => ActivityData::from_metadata(payload),
+                    None => {
+                        ActivityData::from_metadata(payload, &self.options.default_icon_asset_key)
+                    }
                 };
                 self.data = Some(new_data);
                 self.last_sent_end_timestamp = None;
@@ -187,7 +172,7 @@ impl RpcWorker {
             return;
         }
 
-        let mut client = DiscordIpcClient::new(APP_ID);
+        let mut client = DiscordIpcClient::new(&self.options.app_id);
         match client.connect() {
             Ok(()) => {
                 info!("Discord IPC 已连接");
@@ -228,6 +213,7 @@ impl RpcWorker {
                 &mut self.last_sent_end_timestamp,
                 self.show_when_paused,
                 self.display_mode,
+                &self.options,
             );
             if !success {
                 self.disconnect();
@@ -235,18 +221,16 @@ impl RpcWorker {
         }
     }
 
-    fn build_base_activity(data: &ActivityData, display_mode: DiscordDisplayMode) -> Activity<'_> {
+    fn build_base_activity<'a>(
+        data: &'a ActivityData,
+        display_mode: DiscordDisplayMode,
+        options: &'a DiscordOptions,
+    ) -> Activity<'a> {
         let assets = Assets::new()
             .large_image(&data.cached_cover_url)
             .large_text(&data.metadata.album_name)
-            .small_image(SP_ICON_ASSET_KEY)
-            .small_text("SPlayer");
-
-        let buttons = data
-            .cached_song_url
-            .as_deref()
-            .map(|url| vec![Button::new("🎧 Listen", url)])
-            .unwrap_or_default();
+            .small_image(&options.default_icon_asset_key)
+            .small_text(&options.small_icon_hover_text);
 
         // 不打开详细信息面板时，在用户名下方显示的小字
         let status_type = match display_mode {
@@ -255,13 +239,26 @@ impl RpcWorker {
             DiscordDisplayMode::Details => StatusDisplayType::Details,
         };
 
-        Activity::new()
+        let mut activity = Activity::new()
             .details(&data.metadata.song_name)
             .state(&data.metadata.author_name)
             .activity_type(ActivityType::Listening)
             .assets(assets)
-            .buttons(buttons)
-            .status_display_type(status_type)
+            .status_display_type(status_type);
+
+        if let Some(buttons) = &data.metadata.discord_buttons {
+            let drp_buttons: Vec<Button<'a>> = buttons
+                .iter()
+                .take(2)
+                .map(|b| Button::new(b.label.as_str(), b.url.as_str()))
+                .collect();
+
+            if !drp_buttons.is_empty() {
+                activity = activity.buttons(drp_buttons);
+            }
+        }
+
+        activity
     }
 
     fn calc_paused_timestamps(current_time: f64, duration: f64) -> (i64, i64) {
@@ -282,7 +279,6 @@ impl RpcWorker {
     }
 
     fn calc_playing_timestamps(current_time: f64, duration: f64) -> (i64, i64) {
-        // 边界检查：如果当前时间超过总时长，返回无效时间戳
         if current_time >= duration {
             return (0, 0);
         }
@@ -308,8 +304,9 @@ impl RpcWorker {
         last_sent_end_timestamp: &mut Option<i64>,
         show_when_paused: bool,
         display_mode: DiscordDisplayMode,
+        options: &DiscordOptions,
     ) -> bool {
-        let mut activity = Self::build_base_activity(data, display_mode);
+        let mut activity = Self::build_base_activity(data, display_mode, options);
         let mut new_end_timestamp = None;
         let should_send;
 
@@ -338,7 +335,7 @@ impl RpcWorker {
                             Assets::new()
                                 .large_image(&data.cached_cover_url)
                                 .large_text(&data.metadata.album_name)
-                                .small_image(SP_ICON_ASSET_KEY)
+                                .small_image(&options.default_icon_asset_key)
                                 .small_text("Paused"),
                         );
                 }
@@ -401,8 +398,8 @@ impl RpcWorker {
     }
 }
 
-fn background_loop(rx: &Receiver<RpcMessage>) {
-    let mut worker = RpcWorker::default();
+fn background_loop(rx: &Receiver<RpcMessage>, options: DiscordOptions) {
+    let mut worker = RpcWorker::new(options);
 
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
@@ -420,13 +417,18 @@ fn background_loop(rx: &Receiver<RpcMessage>) {
     }
 }
 
-pub fn init() {
+pub fn init(options: Option<DiscordOptions>) {
+    let Some(opts) = options else {
+        info!("未提供 Discord 配置，Discord RPC 已被禁用");
+        return;
+    };
+
     let (tx, rx) = mpsc::channel();
     if let Ok(mut guard) = SENDER.lock() {
         *guard = Some(tx);
     }
     thread::spawn(move || {
-        background_loop(&rx);
+        background_loop(&rx, opts);
     });
 }
 

@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +85,8 @@ pub struct MetadataPayload {
     /// 可选的曲目 ID，用于 macOS PersistentID 和 Linux D-Bus Track ID 的唯一标识
     pub track_id: Option<i64>,
 
-    /// Discord RPC 按钮链接，直接用于 Discord Activity 的按钮跳转
-    pub discord_button_url: Option<String>,
+    /// Discord RPC 按钮。最多支持 2 个，超出部分将被自动忽略
+    pub discord_buttons: Option<Vec<DiscordButton>>,
 
     /// 当前歌曲时长，单位是毫秒
     ///
@@ -112,7 +111,7 @@ impl fmt::Debug for MetadataPayload {
             .field("original_cover_url", &self.original_cover_url)
             .field("genre", &self.genre)
             .field("track_id", &self.track_id)
-            .field("discord_button_url", &self.discord_button_url)
+            .field("discord_buttons", &self.discord_buttons)
             .field("duration", &self.duration)
             .finish()
     }
@@ -177,4 +176,36 @@ pub struct DiscordConfigPayload {
 
     /// 显示模式，参考 [`DiscordDisplayMode`]
     pub display_mode: Option<DiscordDisplayMode>,
+}
+
+/// Discord 按钮定义
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordButton {
+    /// 按钮上显示的文字
+    pub label: String,
+    /// 点击按钮后跳转的 URL
+    pub url: String,
+}
+
+/// Discord RPC 的静态初始化配置
+#[derive(Debug, Clone)]
+pub struct DiscordOptions {
+    /// Discord 开发者平台上的 Application ID
+    pub app_id: String,
+
+    /// 默认图标的 Asset Key。
+    /// 当没有提供封面时，会将其作为大图标；同时它也会作为右下角的小图标显示。
+    pub default_icon_asset_key: String,
+
+    /// 小图标的 Hover 文本，通常是你的应用名称
+    pub small_icon_hover_text: String,
+}
+
+/// 统一的初始化配置项
+#[derive(Debug, Clone, Default)]
+pub struct NowPlayingOptions {
+    /// 窗口句柄，Windows 环境下必传
+    pub hwnd: Option<isize>,
+    /// Discord 配置，传 None 则代表禁用/不初始化 Discord RPC
+    pub discord: Option<DiscordOptions>,
 }
